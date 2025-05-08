@@ -1,32 +1,14 @@
+// Improved WebSocket server with better CORS and error handling
 const WebSocket = require('ws');
 const http = require('http');
 const { setupWSConnection } = require('y-websocket/bin/utils');
-const { networkInterfaces } = require('os');
 
-// Configure allowed origins (update these based on your deployment)
-const ALLOWED_ORIGINS = [
-  // Development origins
-  'http://localhost:3000',
-  'https://localhost:3000',
-  'http://127.0.0.1:3000',
-  // Add your production domains here
-  'https://yourdomain.com',
-  'https://www.yourdomain.com',
-  // If deploying on Cloudflare, add those domains
-  'https://your-cloudflare-pages-domain.pages.dev',
-  'https://collabsimpli.com'
-];
-
-// Create HTTP server with CORS support
+// Create HTTP server with very permissive CORS
 const server = http.createServer((request, response) => {
-  // Get origin from headers
-  const origin = request.headers.origin;
-  
-  // Set CORS headers
-  response.setHeader('Access-Control-Allow-Origin', 
-    ALLOWED_ORIGINS.includes(origin) ? origin : '*');
+  // Set very permissive CORS headers
+  response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  response.setHeader('Access-Control-Allow-Headers', '*');
   response.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
   
   // Handle preflight requests
@@ -36,13 +18,13 @@ const server = http.createServer((request, response) => {
     return;
   }
   
-  // Health check endpoint
+  // Simple health check endpoint
   if (request.url === '/health') {
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ 
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      connections: wss ? wss.clients.size : 0
+      status: 'up',
+      connections: wss ? wss.clients.size : 0,
+      timestamp: new Date().toISOString()
     }));
     return;
   }
@@ -52,115 +34,105 @@ const server = http.createServer((request, response) => {
   response.end('WebSocket server is running');
 });
 
-// Create WebSocket server
+// Create WebSocket server with better error handling
 const wss = new WebSocket.Server({ 
   server,
-  // Increase timeout values for better reliability
-  clientTracking: true,
-  perMessageDeflate: true,
+  // Important: Set very permissive origin check
+  verifyClient: ({ origin, req, secure }) => {
+    // Log connection attempts with origin for debugging
+    console.log(`Connection attempt from origin: ${origin || 'unknown'}`);
+    return true; // Allow all origins
+  },
+  clientTracking: true
 });
 
-// Set up Yjs WebSocket connection handler
+// Override default setupWSConnection to include better logging
+const originalSetupWSConnection = setupWSConnection;
+const enhancedSetupWSConnection = (conn, req, options = {}) => {
+  try {
+    console.log('Setting up Y.js connection', {
+      remoteAddress: req.socket.remoteAddress,
+      path: req.url
+    });
+    
+    // Apply original setup with error handling
+    originalSetupWSConnection(conn, req, options);
+    
+    console.log('Y.js connection successfully established');
+  } catch (err) {
+    console.error('Error in setupWSConnection:', err);
+    // Try to send error to client
+    try {
+      conn.send(JSON.stringify({
+        type: 'error',
+        message: err.message
+      }));
+    } catch (sendErr) {
+      console.error('Could not send error to client:', sendErr);
+    }
+  }
+};
+
+// Track connected clients
+const clients = new Set();
+
+// Handle new WebSocket connections
 wss.on('connection', (ws, req) => {
-  // Enable ping/pong to detect dead connections
+  // Setup ping/pong for connection monitoring
   ws.isAlive = true;
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
+  ws.on('pong', () => { ws.isAlive = true; });
   
-  // Set up the Yjs WebSocket connection
-  setupWSConnection(ws, req);
+  // Add to client tracking
+  clients.add(ws);
   
-  console.log(`Client connected. Total connections: ${wss.clients.size}`);
+  console.log(`New connection established (total: ${clients.size})`);
+  console.log(`Client IP: ${req.socket.remoteAddress}`);
+  console.log(`Request URL: ${req.url}`);
   
-  // Log disconnections
+  // Set up enhanced Y.js connection
+  enhancedSetupWSConnection(ws, req);
+  
+  // Handle disconnections
   ws.on('close', () => {
-    console.log(`Client disconnected. Remaining connections: ${wss.clients.size}`);
+    clients.delete(ws);
+    console.log(`Connection closed (remaining: ${clients.size})`);
   });
 });
 
-// Set up heartbeat interval to detect dead connections
-const interval = setInterval(() => {
+// Health check interval
+const pingInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
-      console.log('Terminating dead connection');
+      console.log('Terminating inactive connection');
+      clients.delete(ws);
       return ws.terminate();
     }
     
     ws.isAlive = false;
     ws.ping(() => {});
   });
-}, 30000); // Check every 30 seconds
+}, 30000);
 
-// Clean up interval on server close
+// Clean up on server close
 wss.on('close', () => {
-  clearInterval(interval);
+  clearInterval(pingInterval);
+  console.log('WebSocket server closed');
 });
-
-// Handle server shutdown gracefully
-function handleShutdown() {
-  console.log('Shutting down WebSocket server...');
-  
-  // Close WebSocket server
-  wss.close(() => {
-    console.log('WebSocket server closed');
-    
-    // Close HTTP server
-    server.close(() => {
-      console.log('HTTP server closed');
-      process.exit(0);
-    });
-  });
-  
-  // Force exit after 5 seconds if graceful shutdown fails
-  setTimeout(() => {
-    console.error('Forced shutdown after timeout');
-    process.exit(1);
-  }, 5000);
-}
-
-// Set up signal handlers for graceful shutdown
-process.on('SIGTERM', handleShutdown);
-process.on('SIGINT', handleShutdown);
 
 // Get the port from environment or use default
 const PORT = process.env.PORT || 1234;
-const HOST = process.env.HOST || '0.0.0.0'; // 0.0.0.0 allows connections from any IP
+const HOST = '0.0.0.0';
 
 // Start the server
 server.listen(PORT, HOST, () => {
-  console.log(`\n🚀 WebSocket server running on port ${PORT}`);
-  
-  // Display connection information
-  console.log('\n==== CONNECTION INFO ====');
-  console.log(`Local: ws://localhost:${PORT}`);
-  
-  // Get and display local network IPs
-  const nets = networkInterfaces();
-  const results = [];
-
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
-      // Skip over non-IPv4 and internal addresses
-      if (net.family === 'IPv4' && !net.internal) {
-        results.push(net.address);
-      }
-    }
-  }
-  
-  if (results.length > 0) {
-    console.log('\n==== NETWORK ACCESS ====');
-    console.log('Share these URLs with collaborators on your network:\n');
-    
-    results.forEach(ip => {
-      console.log(`Network: ws://${ip}:${PORT}`);
-    });
-  }
-  
-  console.log('\n==== CLIENT CONFIG ====');
-  console.log('In your client config, set this URL for websocket connections:');
-  console.log(`  -> ws://YOUR_SERVER_IP:${PORT}\n`);
-  
-  console.log('==== HEALTH CHECK ====');
-  console.log(`Health check: http://localhost:${PORT}/health\n`);
+  console.log(`
+==================================
+WebSocket Server Running
+==================================
+- Port: ${PORT}
+- Host: ${HOST}
+- Time: ${new Date().toISOString()}
+- Clients: ${clients.size}
+==================================
+  `);
 });
