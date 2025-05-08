@@ -1,11 +1,13 @@
-// Improved WebSocket server with better CORS and error handling
+// Improved WebSocket server for Render.com with enhanced error handling
 const WebSocket = require('ws');
 const http = require('http');
 const { setupWSConnection } = require('y-websocket/bin/utils');
 
-// Create HTTP server with very permissive CORS
+// Create HTTP server with permissive CORS
 const server = http.createServer((request, response) => {
-  // Set very permissive CORS headers
+  console.log(`Received HTTP request: ${request.method} ${request.url}`);
+  
+  // Set permissive CORS headers
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', '*');
@@ -13,93 +15,50 @@ const server = http.createServer((request, response) => {
   
   // Handle preflight requests
   if (request.method === 'OPTIONS') {
+    console.log('Handling CORS preflight request');
     response.writeHead(204);
     response.end();
     return;
   }
   
-  // Simple health check endpoint
+  // Add health check endpoint
   if (request.url === '/health') {
     response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify({ 
-      status: 'up',
-      connections: wss ? wss.clients.size : 0,
-      timestamp: new Date().toISOString()
+    response.end(JSON.stringify({
+      status: 'ok',
+      time: new Date().toISOString(),
+      activeConnections: wss ? wss.clients.size : 0
     }));
     return;
   }
   
-  // Default response
-  response.writeHead(200, { 'Content-Type': 'text/plain' });
-  response.end('WebSocket server is running');
+  // Add root endpoint for basic check
+  if (request.url === '/' || request.url === '') {
+    response.writeHead(200, { 'Content-Type': 'text/plain' });
+    response.end('WebSocket server is running');
+    return;
+  }
+  
+  // Fallback for other routes
+  response.writeHead(404);
+  response.end('Not found');
 });
 
-// Create WebSocket server with better error handling
+// Create WebSocket server with the HTTP server as a handler
 const wss = new WebSocket.Server({ 
   server,
-  // Important: Set very permissive origin check
-  verifyClient: ({ origin, req, secure }) => {
-    // Log connection attempts with origin for debugging
-    console.log(`Connection attempt from origin: ${origin || 'unknown'}`);
-    return true; // Allow all origins
-  },
-  clientTracking: true
+  // Allow more permissive client connections
+  perMessageDeflate: false,
+  clientTracking: true,
+  // Increase timeouts
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
-// Override default setupWSConnection to include better logging
-const originalSetupWSConnection = setupWSConnection;
-const enhancedSetupWSConnection = (conn, req, options = {}) => {
-  try {
-    console.log('Setting up Y.js connection', {
-      remoteAddress: req.socket.remoteAddress,
-      path: req.url
-    });
-    
-    // Apply original setup with error handling
-    originalSetupWSConnection(conn, req, options);
-    
-    console.log('Y.js connection successfully established');
-  } catch (err) {
-    console.error('Error in setupWSConnection:', err);
-    // Try to send error to client
-    try {
-      conn.send(JSON.stringify({
-        type: 'error',
-        message: err.message
-      }));
-    } catch (sendErr) {
-      console.error('Could not send error to client:', sendErr);
-    }
-  }
-};
-
-// Track connected clients
+// Track clients for debugging
 const clients = new Set();
 
-// Handle new WebSocket connections
-wss.on('connection', (ws, req) => {
-  // Setup ping/pong for connection monitoring
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-  
-  // Add to client tracking
-  clients.add(ws);
-  
-  console.log(`New connection established (total: ${clients.size})`);
-  console.log(`Client IP: ${req.socket.remoteAddress}`);
-  console.log(`Request URL: ${req.url}`);
-  
-  // Set up enhanced Y.js connection
-  enhancedSetupWSConnection(ws, req);
-  
-  // Handle disconnections
-  ws.on('close', () => {
-    clients.delete(ws);
-    console.log(`Connection closed (remaining: ${clients.size})`);
-  });
-});
-
-// Health check interval
+// Setup connection monitoring
 const pingInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
@@ -109,30 +68,100 @@ const pingInterval = setInterval(() => {
     }
     
     ws.isAlive = false;
-    ws.ping(() => {});
+    ws.ping();
   });
 }, 30000);
 
-// Clean up on server close
+// Log WebSocket server events
+wss.on('listening', () => {
+  console.log('WebSocket server is now listening for connections');
+});
+
 wss.on('close', () => {
   clearInterval(pingInterval);
   console.log('WebSocket server closed');
 });
 
-// Get the port from environment or use default
-const PORT = process.env.PORT || 1234;
+wss.on('error', (error) => {
+  console.error('WebSocket server error:', error);
+});
+
+// Set up the Y.js WebSocket connection
+wss.on('connection', (ws, req) => {
+  // Setup ping/pong for connection monitoring
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  
+  // Add to client tracking
+  clients.add(ws);
+  
+  const clientIp = req.socket.remoteAddress;
+  console.log(`New WebSocket connection from ${clientIp} (total: ${clients.size})`);
+  console.log(`Request URL: ${req.url}`);
+  
+  // Setup Y.js connection with additional error handling
+  try {
+    setupWSConnection(ws, req);
+    console.log(`Successfully set up Y.js connection for client ${clientIp}`);
+    
+    // Send welcome message
+    try {
+      ws.send(JSON.stringify({ type: 'welcome', message: 'Connected to Y.js WebSocket server' }));
+    } catch (sendErr) {
+      console.error('Error sending welcome message:', sendErr);
+    }
+    
+  } catch (err) {
+    console.error('Error in setupWSConnection:', err);
+    
+    // Try to send error to client before disconnecting
+    try {
+      ws.send(JSON.stringify({ error: 'Failed to set up Y.js connection' }));
+    } catch (sendErr) {
+      console.error('Error sending error message to client:', sendErr);
+    }
+    
+    // Close socket with error code
+    ws.close(1011, 'Internal server error');
+  }
+  
+  // Handle disconnections
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log(`Connection closed (remaining: ${clients.size})`);
+  });
+});
+
+// Use Render's PORT environment variable or fallback to 10000
+const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
 
-// Start the server
 server.listen(PORT, HOST, () => {
-  console.log(`
-==================================
-WebSocket Server Running
-==================================
-- Port: ${PORT}
-- Host: ${HOST}
-- Time: ${new Date().toISOString()}
-- Clients: ${clients.size}
-==================================
-  `);
+  console.log('==================================');
+  console.log('WebSocket Server Running');
+  console.log('==================================');
+  console.log(`- Port: ${PORT}`);
+  console.log(`- Host: ${HOST}`);
+  console.log(`- Time: ${new Date().toISOString()}`);
+  console.log(`- Clients: ${clients.size}`);
+  console.log(`- Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('==================================');
+});
+
+// Handle server errors
+server.on('error', (err) => {
+  console.error('Server error:', err);
+});
+
+// Handle process termination
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  clearInterval(pingInterval);
+  wss.close(() => {
+    console.log('WebSocket server closed');
+    server.close(() => {
+      console.log('HTTP server closed');
+      process.exit(0);
+    });
+  });
 });
